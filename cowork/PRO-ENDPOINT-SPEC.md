@@ -1,0 +1,221 @@
+# claude-mem-pro: Cowork hook endpoints — drop-in spec
+
+Two endpoints let hook-based clients that can't run the local worker (Cowork
+cloud containers, CI, any remote harness) stream raw tool-use fragments to the
+cloud and pull compiled context back. Pro runs the worker + observer
+server-side; this is deliberately the same shape as the local pipeline so the
+existing worker code path can be reused.
+
+Client reference implementation: `scripts/cmem-hook.mjs` in the
+`cmem-pro` plugin (this package).
+
+---
+
+## Auth
+
+Both endpoints reuse the existing `/api/mcp` bearer validation. A request is
+authorized if **either**:
+
+- (a) `Authorization: Bearer <api key>` — a valid Pro API key (unchanged
+  legacy path, kept for power users and CI), **or**
+- (b) `Authorization: Bearer <OAuth access token>` — a valid OAuth access
+  token whose granted scopes include `write:memory`, **for
+  `POST /api/hooks/ingest` only**.
+
+A valid OAuth token **without** `write:memory` is rejected on ingest with the
+same `401 {"error":"invalid_token"}` as an invalid key — do not leak which
+part failed. Read endpoints keep read semantics: `GET /api/hooks/context`
+requires `read:memory`; the `scope=status` auth/health probe accepts any
+valid credential (OAuth or API key) since it returns `200 {}` and no
+content. Invalid/missing bearer → `401 {"error":"invalid_token"}` (+
+`WWW-Authenticate` per the OAuth work).
+
+Clients also send `X-CMEM-Platform: cowork` — store it as `platformSource`
+on everything created from the request. Under OAuth the client must still
+send `platform` in each envelope and `X-CMEM-Platform` on the request; a
+missing platform records as `unknown`, never as another agent's label.
+
+### The `write:memory` scope
+
+- **Name:** `write:memory` — symmetric with `read:memory`, deliberately
+  ungranular for v1.
+- **Capability:** the app may submit hook envelopes to
+  `/api/hooks/ingest` (session-start, session-init, observation,
+  subagent-stop, summarize, session-end) on the user's behalf; the Pro
+  observer synthesizes these into memory server-side.
+- **Does NOT grant:** reading memory (that's `read:memory`), admin access,
+  or quota/spend controls (`spend:inference` is separate).
+- **Advertised** alongside `read:memory`, `offline_access`, and
+  `spend:inference` in the OAuth discovery metadata, dynamic client
+  registration, and the consent screen.
+
+Consent-screen copy (exact wording), next to `read:memory` ("This app can
+read your synced agent memory"):
+
+> **`write:memory` — "This app can save observations to your memory."**
+
+Subtext: "The app sends conversation fragments to Claude-Mem Pro, which
+turns them into searchable memories. You can see everything it wrote and
+disconnect it any time." No jargon ("ingest", "envelopes", "observer") on
+the consent screen.
+
+Abuse posture is unchanged: open dynamic client registration + per-app,
+per-user approval is the boundary, plus per-client rate limits, idempotent
+dedupe, 256 KB body caps, and the provenance audit trail that lets a user
+see exactly what each connected app wrote.
+
+### Provenance (required)
+
+Every ingested event MUST carry provenance answering *which agent made this*,
+so any agent reading memory can tell "this came from your Cursor session
+yesterday":
+
+| Field | Required | Meaning |
+|---|---|---|
+| `platform` (envelope) / `X-CMEM-Platform` (header) | **yes** | Agent family: `claude`, `codex`, `cursor`, `cowork`, `muse`, `chatgpt`, ... Lowercased, normalized server-side via `normalizePlatformSource`. Missing/empty MUST NOT silently default to `claude` — record as `unknown`. |
+| `payload.agent_id` | no | Specific agent instance id, when the client has one. |
+| `payload.agent_type` | no | Agent role/type, when the client has one. |
+| `payload.client_version` | no | Client build version, for debugging skew. |
+
+Server-side rules:
+- Normalize `platform` with the shared `normalizePlatformSource` (same as local).
+- Persist the normalized value on the event row (`platform_source`), the
+  session row, and the generated observation row (denormalized) — never only
+  inside the JSON payload.
+- `source_adapter` must reflect the actual client (`{platform}-compat` or a
+  client-provided value), never a hardcoded single value.
+- `received_at` is stamped by the server; the client's `ts` is `captured_at`.
+
+---
+
+## 1) POST /api/hooks/ingest
+
+Accepts one **envelope** or a batch (spool flush).
+
+```jsonc
+// single
+{
+  "v": 1,
+  "platform": "cowork",          // → platformSource
+  "event": "observation",        // see event table
+  "project": "cowork",           // client-configured project slug
+  "session_id": "abc123",        // harness session id (namespace per platform+key)
+  "ts": 1755900000,              // client unix seconds (server also stamps received_at)
+  "payload": { ... }             // event-specific, below
+}
+
+// batch (client spool flush, oldest first)
+{ "v": 1, "batch": [ { ...envelope }, ... ] }
+```
+
+**Response**: `202 {"accepted": N}`. Never block the client on synthesis —
+enqueue and return. Per-envelope failures inside a batch are dropped server-side
+(client already treats the batch as fire-and-forget).
+
+**Limits**: request body ≤ 256 KB (client truncates fields to 16 KB); rate
+limit per key ~120 req/min (client fires ≤1 per tool call). Oversize → `413`,
+rate → `429`; client spools and retries later — both are safe to return.
+
+### Event table → worker mapping
+
+| `event` | payload fields | worker equivalent |
+|---|---|---|
+| `session-start` | `session_id, cwd, source` | `hook claude-code context` (registration half) |
+| `session-init` | `session_id, cwd, prompt` (≤4 KB) | `hook claude-code session-init` |
+| `observation` | `session_id, cwd, tool_name, tool_use_id, tool_input, tool_response` (each ≤16 KB) | `hook claude-code observation` |
+| `subagent-stop` | `session_id, agent_id, agent_type, tool_use_id` | (new — closes an agent scope) |
+| `summarize` | `session_id, cwd` | `hook claude-code summarize` |
+| `session-end` | `session_id, reason` | session close |
+
+### Ingestion semantics (reuse the local pipeline)
+
+- An `observation` envelope is exactly a **PendingMessage tool-use fragment**:
+  push into the per-session in-RAM queue (`SessionMessageBuffer`), dedupe by
+  `tool_use_id` — identical to what local hooks feed the worker. The observer
+  generator, response parsing, and DB writes are unchanged.
+- Cloud caveat the local buffer never had: sessions arrive from many keys.
+  Bound the per-session buffer and evict idle sessions (no fragment for
+  ~30 min → force a summarize pass and drop the buffer). Don't inherit the
+  unbounded-RAM behavior (#3588).
+- `session-init` carries the user prompt → same role as local session-init
+  (observer context for the turn).
+- `summarize` / `session-end` trigger the same summarize path as local Stop.
+- Dedupe batch replays: `(api_key, platform, session_id, tool_use_id)` unique
+  for observations; other events are idempotent by `(session_id, event, ts)`.
+  Under OAuth there is no API key string, so the dedupe tuple becomes
+  `(oauth_user_sub, oauth_client_id, platform, session_id, tool_use_id)`,
+  and non-observation events stay idempotent by `(session_id, event, ts)`
+  within the same identity namespace.
+- Session namespacing is per (user, OAuth client, platform) under OAuth —
+  the analogue of the spec's "per platform+key" rule. Two different apps
+  must never collide on or see each other's `session_id` namespace.
+- Rate limits apply per OAuth client (mirror the ~120 req/min budget), not
+  per user — one chatty app shouldn't burn another's budget.
+
+---
+
+## 2) GET /api/hooks/context
+
+Compiles the injection block server-side (client caps at ~6 KB and wraps in
+`<claude-mem-context>` tags itself — return plain text/markdown, no wrapper).
+
+```
+GET /api/hooks/context?project=cowork&scope=session-start
+GET /api/hooks/context?project=cowork&scope=agent&q=<first 500 chars of agent prompt>
+GET /api/hooks/context?project=cowork&scope=status        // cheap auth/health probe
+```
+
+**Response**: `200 {"context": "…markdown…", "count": 12}`.
+Empty memory → `200 {"context": ""}` (client injects nothing).
+`scope=status` → `200 {}` is fine; it's only used by the diagnostics CLI.
+
+**Content**, same recipe as local SessionStart injection:
+
+- `session-start`: recent-observation timeline for `project` (most recent
+  sessions first, timestamped one-liners), same selection the local
+  `context` hook compiles. Include cross-platform observations — that's the
+  whole point of Cowork↔Code continuity.
+- `agent`: rank by relevance to `q` (memory_search under the hood), ~10 items.
+- Target ≤ 5 KB. The client truncates anyway; don't bother paginating.
+
+### Client fallback to /api/mcp (already live)
+
+Until this endpoint deploys, the plugin falls back to JSON-RPC
+`tools/call memory_search` against `/api/mcp` (stateless attempt first, then
+`initialize` handshake honoring `Mcp-Session-Id`). Nothing to build — just be
+aware injected context = raw memory_search text until `/api/hooks/context`
+ships, so shipping it is what makes injection quality match local.
+
+### 3) `save_memory` tool on the hosted MCP connector
+
+Some hosts (Claude Duet cloud sessions) block the container's own network from
+cmem.ai, so the hooks above can't send anything. The hosted MCP connector still
+works there, because the host calls it through its own connector path.
+
+The hosted connector has `save_memory`:
+
+- **Input:** `text` (required, up to 8000 characters), `title`, `project`,
+  `metadata` (object, free-form provenance such as
+  `{ "host": "duet", "channel": "chan_…" }`).
+- **Behavior:** `<private>` text is dropped and secrets are redacted server-side.
+
+When the plugin can't reach cmem.ai, the injected notice points at the connector
+for recall and says to save durable decisions through `save_memory` if the
+connector offers it. The notice stays conditional because a connection may not
+offer the tool.
+
+---
+
+## Rollout order
+
+1. `/api/hooks/context` (read-only, low risk) → good injection immediately.
+2. `/api/hooks/ingest` wired into the existing worker queue → Cowork sessions
+   start generating observations.
+3. `write:memory` scope: advertise it (discovery, DCR, consent screen) and
+   accept OAuth tokens carrying it on ingest, with the OAuth identity
+   dedupe/namespacing above. This unblocks third-party OAuth writes — the
+   first is the already-built, already-spooled Muse hourly export, which
+   flushes its backlog over the existing OAuth connection with no key
+   juggling. API-key clients behave exactly as before.
+4. Optional later: per-event ack ids + client-side exactly-once, WebSocket
+   push, and a `platformSource='cowork'` slice in the admin metrics strip.
