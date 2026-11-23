@@ -1,0 +1,5 @@
+export const TIMING = {
+  SSE_RECONNECT_DELAY_MS: 3000,
+
+  STATS_REFRESH_INTERVAL_MS: 10000,
+} as const;

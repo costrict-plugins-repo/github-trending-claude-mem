@@ -1,0 +1,115 @@
+import { describe, it, expect } from 'bun:test';
+import {
+  conversationChars,
+  shouldRecycleConversation,
+  resolveConversationMaxChars,
+  windowAwareConversationMaxChars,
+  OBSERVER_CONVERSATION_MAX_CHARS,
+} from '../../src/shared/observer-recycle.js';
+import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
+import { wrapPriorContext } from '../../src/sdk/prompts.js';
+import type { ConversationMessage } from '../../src/services/worker-types.js';
+
+describe('window-aware generation budget (#3625)', () => {
+  it('retires a narrow-window generation at half its window', () => {
+    // 16k tokens * 0.5 * 4 chars/token.
+    expect(windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, 16_384)).toBe(32_768);
+    // The 131,072 fallback for an unknown endpoint. An operator budget past half
+    // the window is lowered to it (the shipped default is already below that).
+    expect(windowAwareConversationMaxChars(400_000, 131_072)).toBe(262_144);
+  });
+
+  it('keeps the configured budget for windows it already fits inside', () => {
+    expect(windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, 131_072)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, 200_000)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, 1_048_576)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+  });
+
+  it('never raises an operator budget that is already smaller than the window allows', () => {
+    expect(windowAwareConversationMaxChars(20_000, 1_048_576)).toBe(20_000);
+    expect(windowAwareConversationMaxChars(20_000, 16_384)).toBe(20_000);
+  });
+
+  it('keeps the configured budget when the window is unknown', () => {
+    expect(windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, undefined)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+  });
+
+  it('recycles a 16k-window generation long before the fixed budget would', () => {
+    const history = windowOf(8, 5_000); // 40k chars: past half a 16k window, under the 100k default
+    expect(shouldRecycleConversation(history, windowAwareConversationMaxChars(OBSERVER_CONVERSATION_MAX_CHARS, 16_384))).toBe(true);
+    expect(shouldRecycleConversation(history)).toBe(false);
+  });
+});
+
+function windowOf(count: number, charsEach: number): ConversationMessage[] {
+  return Array.from({ length: count }, (_, i) => ({
+    role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+    content: 'x'.repeat(charsEach),
+  }));
+}
+
+describe('observer generation budget (#3800)', () => {
+  it('does not recycle a conversation that is within budget', () => {
+    expect(shouldRecycleConversation(windowOf(10, 1_000))).toBe(false);
+  });
+
+  it('recycles once the generation has spent its budget', () => {
+    const history = windowOf(50, 10_000); // 500k chars > 100k default
+    expect(conversationChars(history)).toBeGreaterThan(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(shouldRecycleConversation(history)).toBe(true);
+  });
+
+  it('checks the budget before a send, so the over-ceiling request is never paid for', () => {
+    // Exactly at the budget must already trigger: the next observation would
+    // push it past, and that request is the one that fails.
+    const atBudget = [{ role: 'user' as const, content: 'x'.repeat(OBSERVER_CONVERSATION_MAX_CHARS) }];
+    expect(shouldRecycleConversation(atBudget)).toBe(true);
+  });
+
+  // The fallback constant and the settings default are two copies of one number:
+  // a malformed setting resolves to the constant, an unset one to the default.
+  it('ships the same budget as the settings default and the fallback', () => {
+    const shipped = SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS;
+    expect(shipped).toBe('100000');
+    expect(resolveConversationMaxChars(shipped)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+  });
+
+  it('honours an operator override and falls back on a malformed one', () => {
+    expect(resolveConversationMaxChars('120000')).toBe(120_000);
+    expect(resolveConversationMaxChars(undefined)).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(resolveConversationMaxChars('')).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(resolveConversationMaxChars('nonsense')).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(resolveConversationMaxChars('0')).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+    expect(resolveConversationMaxChars('-5')).toBe(OBSERVER_CONVERSATION_MAX_CHARS);
+  });
+});
+
+describe('wrapPriorContext — continuity across generations (#3800)', () => {
+  it('is empty for a first generation, leaving the prompt unchanged', () => {
+    expect(wrapPriorContext('')).toBe('');
+    expect(wrapPriorContext('   \n  ')).toBe('');
+  });
+
+  it('carries the session-start context so a fresh generation is not blind', () => {
+    const block = wrapPriorContext('111 2:18p bugfix Fixed the auth redirect');
+
+    expect(block).toContain('Fixed the auth redirect');
+    expect(block).toContain('<session_start_context>');
+    expect(block).toContain('</session_start_context>');
+  });
+
+  it('tells the observer not to re-record what it already captured', () => {
+    expect(wrapPriorContext('something')).toContain('do not re-record');
+  });
+
+  it('does not let the observer read the gap as "the work did not happen"', () => {
+    expect(wrapPriorContext('something')).toContain('do not treat its absence');
+  });
+
+  it('passes the context builder output through verbatim rather than re-rendering it', () => {
+    // The whole point of the change: one renderer, the one the SessionStart
+    // hook already uses. This block must not reformat what it is given.
+    const generated = '### Aug 19\n111056 2:18p discovery Tool search returns same results';
+    expect(wrapPriorContext(generated)).toContain(generated);
+  });
+});
